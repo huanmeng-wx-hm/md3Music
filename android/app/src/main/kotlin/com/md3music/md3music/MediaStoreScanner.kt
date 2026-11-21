@@ -231,7 +231,18 @@ object MediaStoreScanner {
                     if (dataIdx >= 0) {
                         val data = c.getString(dataIdx)
                         if (!data.isNullOrBlank() && File(data).exists()) {
-                            return data
+                            // 修车机上本地歌「看得见目录却没声音」：
+                            // exists() 只证明有这个条目，不证明能真的打开。
+                            // Android 10 起外置卡/部分车机卷会回 EACCES，
+                            // 裸路径一路喂给播放器就变成 errorCode 2006。
+                            // 先真开一次；开不了就落到下面 2) 的 content Uri
+                            // 拷贝兜底，让播放器读 App 自己私有目录里的副本。
+                            val readable = try {
+                                java.io.RandomAccessFile(data, "r").use { true }
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (readable) return data
                         }
                     }
                 }
