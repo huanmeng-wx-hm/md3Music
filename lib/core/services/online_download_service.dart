@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import '../../data/models/song.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
+import '../../services/kugou_api/kugou_models.dart';
 import '../../services/kugou_server.dart';
 
 /// 在线歌曲「先下载到缓存目录，再播本地文件」。
@@ -30,6 +31,20 @@ class OnlineDownloadService {
   OnlineDownloadService._();
 
   static final OnlineDownloadService instance = OnlineDownloadService._();
+
+  /// 「没存成」时递一句中文原因给 UI 弹窗；不设就静默回落到在线播放。
+  static void Function(String reason)? onDownloadFailed;
+
+  /// 所有失败分支统一走这里：只递话，不抛错、不阻塞播放流程。
+  String? _fail(String reason) {
+    final cb = OnlineDownloadService.onDownloadFailed;
+    if (cb != null) {
+      try {
+        cb(reason);
+      } catch (_) {}
+    }
+    return null;
+  }
 
   /// 小于这个体积不收：源码里判断试听片段的口径就是「<200KB 且 3~5 分钟」。
   static const int _minBytes = 200 * 1024;
@@ -161,7 +176,6 @@ class OnlineDownloadService {
       quality: quality,
       pinned: true,
       title: song.title,
-      artist: song.artist,
     );
   }
 
@@ -209,10 +223,15 @@ class OnlineDownloadService {
         quality: quality,
       );
     } catch (_) {
-      return null;
+      return _fail('拿不到播放地址：可能没登录、该音质需要会员，或网络不通。');
     }
     // isTrial = 试听片段（如 30 秒），绝不能当完整歌曲存下来。
-    if (play == null || play.url.isEmpty || play.isTrial) return null;
+    if (play == null || play.url.isEmpty) {
+      return _fail('服务端没给这一档的完整音频地址。');
+    }
+    if (play.isTrial) {
+      return _fail('这一档只给了试听片段（约 30 秒），不缓存；换一档再试。');
+    }
 
     // 服务端可能降级，实际档和请求档分别记。
     final actualQ = play.quality.isNotEmpty ? play.quality : quality;
@@ -235,14 +254,14 @@ class OnlineDownloadService {
       );
       if (!part.existsSync() || part.lengthSync() < _minBytes) {
         if (part.existsSync()) part.deleteSync();
-        return null;
+        return _fail('只下到半截（或试听片段），已丢弃，不完整的文件不会播。');
       }
       if (file.existsSync()) file.deleteSync();
       part.renameSync(file.path);
     } catch (_) {
-      // CDN 地址过期 / 断网 / 被掐断：静默放弃，交回作者原逻辑兜底。
+      // CDN 地址过期 / 断网 / 被掐断 / 写不进手机
       if (part.existsSync()) part.deleteSync();
-      return null;
+      return _fail('下载中断或写不进手机：可能断网、地址过期或存储不足。');
     }
 
     _index.removeWhere(
