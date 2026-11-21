@@ -30,6 +30,7 @@ import 'core/services/listen_report_service.dart';
 import 'core/services/media_notification_service.dart';
 import 'core/services/music_haptics_service.dart';
 import 'core/services/play_history_sync_service.dart';
+import 'core/services/online_download_service.dart';
 import 'core/services/usb_audio_service.dart';
 import 'core/services/wakelock_service.dart';
 import 'data/repositories/settings_repository.dart';
@@ -44,6 +45,9 @@ import 'widgets/md3_lyric_preferences.dart';
 
 /// 顶级 Navigator 的 GlobalKey，预留供后续扩展使用。
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
+
+/// 「缓存没存成」弹窗同一时间只留一个（与房间确认弹窗同款防重）。
+bool _downloadFailDialogOpen = false;
 
 /// 用于在 MyApp 启动前缓存「冷启动时通过 shortcut 触发」的类型。
 /// QuickActions.initialize 在 runApp 之前注册回调，但此时 Navigator 还未就绪，
@@ -106,6 +110,30 @@ Future<void> _main() async {
 /// 主题模式为 null 时表示从未持久化，由 ThemeProvider 保持初值 ThemeMode.system。
 Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 在线歌曲「先下载到缓存、再播本地」的播放前钩子在此装好。
+  // 必须放 runBootstrap：各入口共用这一流程，冷启动也要生效。
+  OnlineDownloadService.instance.install();
+  // 下载失败时把「为什么没存成」弹出来。
+  // 服务层没有 BuildContext，所以用它递出的一句话 + 全局 navigatorKey 弹窗；
+  // 项目里「词幕失败 / 歌曲无法播放」弹窗也是这个写法。
+  OnlineDownloadService.onDownloadFailed = (reason) {
+    final ctx = appNavigatorKey.currentContext;
+    if (ctx == null || _downloadFailDialogOpen) return;
+    _downloadFailDialogOpen = true;
+    showDialog<void>(
+      context: ctx,
+      builder: (d) => AlertDialog(
+        title: const Text('没存成'),
+        content: Text('$reason\n\n已自动回落到原来的播放方式。'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(d),
+            child: const Text('好'),
+          ),
+        ],
+      ),
+    ).whenComplete(() => _downloadFailDialogOpen = false);
+  };
   final windowsFontFuture = WindowsDefaultFont.load();
   if (Platform.isWindows) {
     _windowsTrayChannel.setMethodCallHandler((call) async {
