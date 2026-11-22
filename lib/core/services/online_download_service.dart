@@ -26,8 +26,10 @@ class DownloadTask {
   });
 
   final String id;
-  final String title;
-  final String artist;
+
+  /// 自动缓存时歌名要等解析到元数据才能回填，所以可写。
+  String title;
+  String artist;
   final String quality;
 
   /// true = 菜单里手动点的「下载」；false = 播放时自动缓存。
@@ -48,6 +50,11 @@ class DownloadTask {
 ///   md3_cache      → 播放缓存（点歌自动整首存，超 1GB 清最旧）
 ///   md3_downloads  → 已下载（菜单手动点「下载」选音质存的，永不自动清）
 /// 纸条 index.json 放在 files/ 根，每条记 path + pinned，UI 按 pinned 分两页。
+///
+/// 命名：缓存与下载共用同一套 —— 「歌曲名 - 歌手[音质标记].扩展名」。
+/// 标准档不标；320 → [320K]、flac → [FLAC]、high/Hi-Res → [HR]、
+/// 蝰蛇母带 → [MASTER]，其余档位兜底成大写缩写。
+/// 同目录撞名自动加 (2) 序号，绝不覆盖已有文件。
 class OnlineDownloadService {
   OnlineDownloadService._();
 
@@ -81,6 +88,11 @@ class OnlineDownloadService {
   final List<Map<String, dynamic>> _index = <Map<String, dynamic>>[];
   final Set<String> _inFlight = <String>{};
 
+  /// 播放源开始时旁路记下的「id → 歌名/歌手」，自动缓存命名用。
+  /// 只从已经在跑的播放链路里捡，不额外发请求、不顶掉宿主回调。
+  final Map<String, Map<String, String>> _meta =
+      <String, Map<String, String>>{};
+
   void _bump() => revision.value = revision.value + 1;
 
   void _notifyTasks() => tasks.value = List<DownloadTask>.of(tasks.value);
@@ -105,6 +117,18 @@ class OnlineDownloadService {
       // 不顶掉别的宿主已注入的解析器。
       if (prevResolver != null) return prevResolver(id, quality);
       return null;
+    };
+
+    // 顺手记下正在播的那首歌的名字，自动缓存就能按「歌名 - 歌手」落盘。
+    final prevSource = PlayerProvider.onPlaybackSourceStarted;
+    PlayerProvider.onPlaybackSourceStarted = (Song song, String q, String url) {
+      if (song.isOnline) {
+        _meta[song.id] = <String, String>{
+          't': song.title.trim().isEmpty ? song.id : song.title.trim(),
+          'a': song.artist.trim(),
+        };
+      }
+      if (prevSource != null) prevSource(song, q, url);
     };
   }
 
@@ -178,7 +202,7 @@ class OnlineDownloadService {
                 .map((e) => Map<String, dynamic>.from(e)));
         }
       }
-      // 按 pinned 把历史文件归到两个夹子，并把纸条统一写回新位置。
+      // 按 pinned 把历史文件归到两个夹子，顺便统一改成新命名。
       await _relocateAll();
       await _save();
     } catch (_) {
@@ -189,7 +213,7 @@ class OnlineDownloadService {
     _bump();
   }
 
-  /// 每条记录按 pinned 找到它「该在」的夹子，不对就搬过去。
+  /// 每条记录按 pinned 找到它「该在」的夹子，并按统一命名归位。
   /// 覆盖三种历史：内部文档目录、上一版全塞 md3_cache、以及手动/自动混放。
   Future<void> _relocateAll() async {
     final cacheDir = await _ensureDir(false);
@@ -197,24 +221,39 @@ class OnlineDownloadService {
     for (final row in _index) {
       final p = row['path'] as String?;
       if (p == null || !File(p).existsSync()) continue;
-      final expected =
-          (row['pinned'] == true ? dlDir : cacheDir).path;
-      if (p.startsWith('$expected${Platform.pathSeparator}')) continue;
+      final id = (row['id'] as String?) ?? '';
+      var t = (row['title'] as String?)?.trim() ?? '';
+      var a = (row['artist'] as String?)?.trim() ?? '';
+      if (t.isEmpty || t == id) {
+        final m = _meta[id];
+        if (m != null) {
+          t = m['t'] ?? t;
+          a = m['a'] ?? a;
+        }
+      }
+      if (t.isEmpty) t = id;
+      final q = (row['requested'] as String?) ??
+          (row['quality'] as String?) ??
+          '';
+      final dir = row['pinned'] == true ? dlDir : cacheDir;
+      final name = _uniqueName(
+        dir,
+        _displayFileName(t, a, q, _extOfPath(p)),
+        ownPath: p,
+      );
+      final dst = '${dir.path}${Platform.pathSeparator}$name';
+      if (p == dst) continue;
       final f = File(p);
-      final name = p.split(Platform.pathSeparator).last;
-      final dst = '$expected${Platform.pathSeparator}$name';
       try {
-        if (File(dst).existsSync()) {
+        try {
+          f.renameSync(dst);
+        } catch (_) {
+          f.copySync(dst);
           f.deleteSync();
-        } else {
-          try {
-            f.renameSync(dst);
-          } catch (_) {
-            f.copySync(dst);
-            f.deleteSync();
-          }
         }
         row['path'] = dst;
+        row['title'] = t;
+        row['artist'] = a;
       } catch (_) {}
     }
   }
@@ -231,7 +270,10 @@ class OnlineDownloadService {
     return path;
   }
 
-  /// 按档位查本地：请求档优先 → 实际档 → 该歌任意一档（降级兜底）。
+  /// 按档位查本地：**只认同歌 + 同档**。
+  /// 请求档优先 → 实际档（服务端降级时两者不同）。
+  /// 不再「该歌任意一档」兜底：否则手动下载选 320 会把缓存里的 128
+  /// 误判成命中，直接搬进「已下载」夹子，用户点的高音质根本没下。
   Future<String?> _localFor(String id, String quality) async {
     await _load();
     for (final row in _index) {
@@ -242,12 +284,6 @@ class OnlineDownloadService {
     }
     for (final row in _index) {
       if (row['id'] == id && row['quality'] == quality) {
-        final p = _pathOf(row);
-        if (p != null) return p;
-      }
-    }
-    for (final row in _index) {
-      if (row['id'] == id) {
         final p = _pathOf(row);
         if (p != null) return p;
       }
@@ -272,6 +308,11 @@ class OnlineDownloadService {
       for (final row in _index) {
         if (row['id'] == song.id && _pathOf(row) == hit) {
           row['pinned'] = true;
+          row['title'] = song.title.trim().isEmpty ? song.id : song.title.trim();
+          row['artist'] = song.artist.trim();
+          // 老纸条可能没记档位，补上，搬完重新查路径时才不会扑空。
+          row['requested'] = quality;
+          row['quality'] = (row['quality'] as String?) ?? quality;
         }
       }
       await _relocateAll();
@@ -388,13 +429,27 @@ class OnlineDownloadService {
       return _fail('这一档只给了试听片段（约 30 秒），不缓存；换一档再试。', task);
     }
 
-    // 服务端可能降级，实际档和请求档分别记。
+    // 服务端可能降级，实际档和请求档分别记；文件名按「用户点的那档」标。
     final actualQ = play.quality.isNotEmpty ? play.quality : quality;
     final dir = await _ensureDir(pinned);
-    final safeId = id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-    final safeQ = actualQ.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
     final ext = _extFrom(play.url);
-    final file = File('${dir.path}/${safeId}_$safeQ$ext');
+
+    // 手动下载自带 Song；自动缓存只有 id，先从播放旁路捡，再查详情兜底。
+    var metaTitle = (title ?? '').trim();
+    var metaArtist = (artist ?? '').trim();
+    if (metaTitle.isEmpty) {
+      final m = await _resolveMeta(id);
+      if (m != null) {
+        metaTitle = m['t'] ?? '';
+        metaArtist = m['a'] ?? '';
+      }
+    }
+    if (metaTitle.isEmpty) metaTitle = id;
+    task.title = metaTitle;
+    task.artist = metaArtist;
+    _notifyTasks();
+
+    final file = File(_allocatePath(dir, metaTitle, metaArtist, quality, ext));
     final part = File('${file.path}.part');
     if (part.existsSync()) part.deleteSync();
 
@@ -430,8 +485,8 @@ class OnlineDownloadService {
         (r) => r['id'] == id && r['requested'] == quality);
     _index.add(<String, dynamic>{
       'id': id,
-      'title': title ?? id,
-      'artist': artist ?? '',
+      'title': metaTitle,
+      'artist': metaArtist,
       'requested': quality,
       'quality': actualQ,
       'path': file.path,
@@ -443,6 +498,27 @@ class OnlineDownloadService {
     if (!pinned) await _pruneIfNeeded();
     _bump();
     return file.path;
+  }
+
+  /// 自动缓存拿歌名：先捡播放旁路记下的，再向本地 API 查详情兜底。
+  /// 查不到就退回用 id，绝不因为缺元数据把下载卡住。
+  Future<Map<String, String>?> _resolveMeta(String id) async {
+    final cached = _meta[id];
+    if (cached != null) return cached;
+    try {
+      final detail = await KugouApiClient()
+          .getSongDetail(id)
+          .timeout(const Duration(seconds: 4));
+      if (detail != null && detail.songName.trim().isNotEmpty) {
+        final m = <String, String>{
+          't': detail.songName.trim(),
+          'a': (detail.artistName ?? '').trim(),
+        };
+        _meta[id] = m;
+        return m;
+      }
+    } catch (_) {}
+    return null;
   }
 
   /// 「已下载」页列表（按时间倒序）。pinned 由 UI 自己分两页。
@@ -541,6 +617,106 @@ class OnlineDownloadService {
       await _save();
       _bump();
     } catch (_) {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // 命名工具：缓存与手动下载共用，标准档不标，其余档位加方括号缩写。
+  // ---------------------------------------------------------------------------
+
+  static String _qualityTag(String q) {
+    final v = q.trim().toLowerCase();
+    if (v.isEmpty) return '';
+    if (v == '128' || v == 'standard' || v == '标准' || v == 'normal') {
+      return '';
+    }
+    // 纯数字档位（192 / 320 / 999 等）统一写成 [xxxK]。
+    if (RegExp(r'^\d+$').hasMatch(v)) return '[${v}K]';
+    switch (v) {
+      case 'hq':
+      case '高品质':
+        return '[320K]';
+      case 'flac':
+      case 'sq':
+      case 'lossless':
+      case '无损':
+        return '[FLAC]';
+      case 'high': // AudioQuality.hires 的 value
+      case 'hires':
+      case 'hi-res':
+      case 'hr':
+        return '[HR]';
+      case 'viper':
+      case 'viper_tape':
+      case 'master':
+        return '[MASTER]';
+      default:
+        return '[${v.toUpperCase()}]';
+    }
+  }
+
+  static String _displayFileName(
+    String title,
+    String artist,
+    String quality,
+    String ext,
+  ) {
+    String clean(String s) => s
+        .replaceAll(RegExp(r'[\\/:*?"<>|\r\n\t]'), '_')
+        .trim()
+        .replaceAll(RegExp(r'\.+$'), '');
+    final t = clean(title.isEmpty ? '未知歌曲' : title);
+    final a = clean(artist.isEmpty ? '未知歌手' : artist);
+    var base = '$t - $a';
+    // 按 Unicode 码点截断，避免把 emoji 切成半个代理对；中文件名也留足余量。
+    if (base.runes.length > 70) {
+      base = String.fromCharCodes(base.runes.take(70)).trim();
+    }
+    final safeExt = ext.startsWith('.') ? ext : '.$ext';
+    final tag = _qualityTag(quality);
+    return tag.isEmpty ? '$base$safeExt' : '$base $tag$safeExt';
+  }
+
+  static String _extOfPath(String p) {
+    final n = p.split(Platform.pathSeparator).last;
+    final d = n.lastIndexOf('.');
+    if (d > 0 && n.length - d <= 6) return n.substring(d).toLowerCase();
+    return '.mp3';
+  }
+
+  /// 同目录里不覆盖：被占了就加 (2)、(3)……；ownPath 是自己的旧路径时不算占用。
+  String _uniqueName(Directory dir, String name, {String? ownPath}) {
+    String candidate(String n) =>
+        '${dir.path}${Platform.pathSeparator}$n';
+    if (!File(candidate(name)).existsSync() || candidate(name) == ownPath) {
+      return name;
+    }
+    final dot = name.lastIndexOf('.');
+    final stem = dot > 0 ? name.substring(0, dot) : name;
+    final ext = dot > 0 ? name.substring(dot) : '';
+    var i = 2;
+    while (true) {
+      final alt = '$stem ($i)$ext';
+      if (!File(candidate(alt)).existsSync() || candidate(alt) == ownPath) {
+        return alt;
+      }
+      i++;
+    }
+  }
+
+  String _allocatePath(
+    Directory dir,
+    String title,
+    String artist,
+    String quality,
+    String ext, {
+    String? ownPath,
+  }) {
+    final name = _uniqueName(
+      dir,
+      _displayFileName(title, artist, quality, ext),
+      ownPath: ownPath,
+    );
+    return '${dir.path}${Platform.pathSeparator}$name';
   }
 
   static String _extFrom(String url) {
