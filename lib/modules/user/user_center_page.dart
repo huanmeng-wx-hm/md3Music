@@ -29,6 +29,7 @@ import 'music_preference_page.dart';
 import 'play_history_page.dart';
 import 'profile_edit_page.dart';
 import 'purchased_page.dart';
+import 'download_library_page.dart';
 import 'sign_in_calendar_page.dart';
 import 'vip_status.dart';
 
@@ -1307,7 +1308,10 @@ class _UserCenterPageState extends State<UserCenterPage> {
   Widget _buildActionGrid(ColorScheme cs) {
     return SliverToBoxAdapter(
       child: Padding(
-        padding: const EdgeInsets.all(AppSpacing.lg),
+        padding: const EdgeInsets.symmetric(
+          horizontal: 12,
+          vertical: AppSpacing.lg,
+        ),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: [
@@ -1329,6 +1333,10 @@ class _UserCenterPageState extends State<UserCenterPage> {
             _actionItem(cs, Icons.shopping_bag_outlined, '已购', () {
               AdaptiveNav.openDetail(context, (_) => const PurchasedPage());
             }),
+            // 第 6 个：和上面 5 个同级、同一套 _actionItem 画法。
+            _actionItem(cs, Icons.download_done, '已下载', () {
+              AdaptiveNav.openDetail(context, (_) => const DownloadLibraryPage());
+            }),
             // 可选扩展：宿主注入的额外操作项（默认无）
             ...?UserCenterPage.extraActionItemsBuilder?.call(context, cs),
           ],
@@ -1344,28 +1352,34 @@ class _UserCenterPageState extends State<UserCenterPage> {
     VoidCallback onTap,
   ) {
     // 图标 + 文字：触摸与 TV 共用同一份视觉。
-    final visual = Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 48,
-          height: 48,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: cs.surfaceContainerHighest,
+    // 6 个并排时给每项固定 50dp，文字不换行，避免窄屏把 Row 撑溢出。
+    final visual = SizedBox(
+      width: 50,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: cs.surfaceContainerHighest,
+            ),
+            child: Icon(icon, size: 22, color: cs.onSurfaceVariant),
           ),
-          child: Icon(icon, color: cs.onSurfaceVariant),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          label,
-          style: Theme.of(
-            context,
-          ).textTheme.labelMedium?.copyWith(color: cs.onSurfaceVariant),
-        ),
-      ],
+          const SizedBox(height: 6),
+          Text(
+            label,
+            maxLines: 1,
+            textAlign: TextAlign.center,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: cs.onSurfaceVariant),
+          ),
+        ],
+      ),
     );
-
     // TV：纯 GestureDetector 在焦点系统里不是节点，遥控永远落不上去
     // （2026-10-04 实测：历史/排行/云盘/已购 四个入口方向键都不可达）。
     // 改用 Material + InkWell（自带可聚焦的 InkResponse）+ DpadFocusable
