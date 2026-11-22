@@ -42,6 +42,10 @@ import 'services/kugou_server.dart';
 import 'utils/landscape_immersive.dart';
 import 'widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'widgets/md3_lyric_preferences.dart';
+import 'core/utils/app_toast.dart';
+import 'data/models/song.dart';
+import 'modules/player/audio_quality_dialog.dart'
+    show kPlayerAudioQualities, audioQualityShortLabel;
 
 /// 顶级 Navigator 的 GlobalKey，预留供后续扩展使用。
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
@@ -655,4 +659,61 @@ class _FallbackErrorWidget extends StatelessWidget {
       ),
     );
   }
+}
+
+
+/// 播放页「⋯ → 添加到歌单」右侧的「下载」按钮。
+///
+/// 放在 main.dart 是因为两套全屏播放页都已经 import 本文件，
+/// 各自只需改一个 ListTile（见 补丁.txt），不必新增 import。
+Future<void> showDownloadQualityDialog(BuildContext context, Song song) async {
+  if (!song.isOnline) return;
+  final picked = await showDialog<String>(
+    context: context,
+    builder: (d) => Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 320),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 20, 24, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text('下载到本地', style: Theme.of(d).textTheme.titleMedium),
+              const SizedBox(height: 6),
+              Text(
+                '选一档，整首存进「已下载」文件夹',
+                style: Theme.of(d).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 10),
+              for (final q in kPlayerAudioQualities)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(d, q.value),
+                    child: Text(audioQualityShortLabel(q)),
+                  ),
+                ),
+              const SizedBox(height: 4),
+              TextButton(
+                onPressed: () => Navigator.pop(d),
+                child: const Text('取消'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+  if (picked == null) return;
+  showToast('开始下载：${song.title}');
+  unawaited(
+    OnlineDownloadService.instance.downloadSong(song, picked).then((path) {
+      showToast(path == null ? '没存成，原因见弹窗' : '已存好：${song.title}');
+    }).catchError((Object e) {
+      // 兜底：服务内部已逐段 catch，这里只防漏网异常变成静默失败。
+      showToast('下载没完成，请重试');
+    }),
+  );
 }
