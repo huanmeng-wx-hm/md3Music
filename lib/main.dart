@@ -666,8 +666,18 @@ class _FallbackErrorWidget extends StatelessWidget {
 ///
 /// 放在 main.dart 是因为两套全屏播放页都已经 import 本文件，
 /// 各自只需改一个 ListTile（见 补丁.txt），不必新增 import。
+///
+/// 打开前先只扫 md3_cache + md3_downloads 两个目录：
+/// 本地有多个不同音质时才加一行提示；一个或零个不显示任何提示。
 Future<void> showDownloadQualityDialog(BuildContext context, Song song) async {
   if (!song.isOnline) return;
+  Set<String> localQ = <String>{};
+  try {
+    localQ = await OnlineDownloadService.instance.localQualitiesFor(song);
+  } catch (_) {
+    // 扫不动也不挡着弹窗：按「没扫到」处理。
+  }
+  final many = localQ.length > 1;
   final picked = await showDialog<String>(
     context: context,
     builder: (d) => Dialog(
@@ -686,13 +696,26 @@ Future<void> showDownloadQualityDialog(BuildContext context, Song song) async {
                 '选一档，整首存进「已下载」文件夹',
                 style: Theme.of(d).textTheme.bodySmall,
               ),
+              if (many)
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Text(
+                    '识别到多个不同音质，已扫描缓存与下载目录，请选择要用的档位',
+                    style: Theme.of(d).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(d).colorScheme.primary,
+                        ),
+                  ),
+                ),
               const SizedBox(height: 10),
               for (final q in kPlayerAudioQualities)
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
                   child: TextButton(
                     onPressed: () => Navigator.pop(d, q.value),
-                    child: Text(audioQualityShortLabel(q)),
+                    child: Text(
+                      audioQualityShortLabel(q) +
+                          (many && localQ.contains(q.value) ? ' · 本地已有' : ''),
+                    ),
                   ),
                 ),
               const SizedBox(height: 4),
