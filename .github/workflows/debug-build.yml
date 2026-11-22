@@ -38,7 +38,8 @@ jobs:
           - package: lite
             application_id: com.md3music.md3music
           - package: apple-music
-            application_id:  com.huanmengwxhm.md3music 
+            application_id: com.huanmengwxhm.md3music
+
 
     steps:
       - name: Checkout repository
