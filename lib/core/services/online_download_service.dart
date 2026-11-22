@@ -52,8 +52,10 @@ class DownloadTask {
 /// 纸条 index.json 放在 files/ 根，每条记 path + pinned，UI 按 pinned 分两页。
 ///
 /// 命名：缓存与下载共用同一套 —— 「歌曲名 - 歌手[音质标记].扩展名」。
-/// 标准档不标；320 → [320K]、flac → [FLAC]、high/Hi-Res → [HR]、
+/// 标准档不标；320 → [HQ]、flac → [SQ]、high/Hi-Res → [HR]、
 /// 蝰蛇母带 → [MASTER]，其余档位兜底成大写缩写。
+/// 播放/打开弹窗前只扫 md3_cache + md3_downloads 两个目录，
+/// 把纸条里没登记的裸文件按文件名认回来；同档两份优先播缓存那份。
 /// 同目录撞名自动加 (2) 序号，绝不覆盖已有文件。
 class OnlineDownloadService {
   OnlineDownloadService._();
@@ -272,30 +274,153 @@ class OnlineDownloadService {
 
   /// 按档位查本地：**只认同歌 + 同档**。
   /// 请求档优先 → 实际档（服务端降级时两者不同）。
-  /// 不再「该歌任意一档」兜底：否则手动下载选 320 会把缓存里的 128
-  /// 误判成命中，直接搬进「已下载」夹子，用户点的高音质根本没下。
+  /// 同一档在缓存和下载各有一份时，**优先返回缓存目录那条**。
   Future<String?> _localFor(String id, String quality) async {
     await _load();
+    String? first;
     for (final row in _index) {
-      if (row['id'] == id && row['requested'] == quality) {
-        final p = _pathOf(row);
-        if (p != null) return p;
-      }
+      if (row['id'] != id || row['requested'] != quality) continue;
+      final p = _pathOf(row);
+      if (p == null) continue;
+      if (_isCachePath(p)) return p;
+      first ??= p;
     }
+    if (first != null) return first;
+    String? second;
     for (final row in _index) {
-      if (row['id'] == id && row['quality'] == quality) {
-        final p = _pathOf(row);
-        if (p != null) return p;
+      if (row['id'] != id || row['quality'] != quality) continue;
+      final p = _pathOf(row);
+      if (p == null) continue;
+      if (_isCachePath(p)) return p;
+      second ??= p;
+    }
+    return second;
+  }
+
+  /// 播放钩子本体：先查纸条 → 再扫两个目录认领裸文件 → 都没有才自动缓存。
+  Future<String?> ensureCached(String id, String quality) async {
+    await _load();
+    final hit = await _localFor(id, quality);
+    if (hit != null) return hit;
+    // 重启后 / 用管理器搬回来 / 纸条丢了，靠文件名把两个目录里的文件认回来。
+    final meta = _metaFor(id);
+    if (meta != null) {
+      await _claimFiles(id: id, title: meta['t'] ?? '', artist: meta['a'] ?? '');
+      final claimed = await _localFor(id, quality);
+      if (claimed != null) return claimed;
+    }
+    return _downloadAndStore(id: id, quality: quality, pinned: false);
+  }
+
+  /// 弹窗用：只扫 md3_cache + md3_downloads，返回这首歌本地已有的档位。
+  /// 顺手把裸文件绑到 song.id 认领进纸条，之后两页列表和播放钩子都能用。
+  Future<Set<String>> localQualitiesFor(Song song) async {
+    await _load();
+    _meta[song.id] = <String, String>{
+      't': song.title.trim().isEmpty ? song.id : song.title.trim(),
+      'a': song.artist.trim(),
+    };
+    await _claimFiles(id: song.id, title: song.title, artist: song.artist);
+    final out = <String>{};
+    for (final row in _index) {
+      if (row['id'] != song.id || _pathOf(row) == null) continue;
+      final q = (row['requested'] as String?) ??
+          (row['quality'] as String?) ??
+          '';
+      if (q.isNotEmpty) out.add(q);
+    }
+    return out;
+  }
+
+  /// 认领时认歌名用的线索：优先播放旁路，其次纸条里同 id 的记录。
+  /// 不发网络请求，断网点歌也不会多等几秒。
+  Map<String, String>? _metaFor(String id) {
+    final m = _meta[id];
+    if (m != null) return m;
+    for (final row in _index) {
+      if (row['id'] != id) continue;
+      final t = (row['title'] as String?)?.trim() ?? '';
+      if (t.isNotEmpty && t != id) {
+        return <String, String>{
+          't': t,
+          'a': (row['artist'] as String?)?.trim() ?? '',
+        };
       }
     }
     return null;
   }
 
-  /// 播放钩子本体：命中就播本地，没命中就整首下完再给路径。
-  Future<String?> ensureCached(String id, String quality) async {
-    final hit = await _localFor(id, quality);
-    if (hit != null) return hit;
-    return _downloadAndStore(id: id, quality: quality, pinned: false);
+  /// 是否落在播放缓存夹子里（同档两份时它优先）。
+  bool _isCachePath(String p) => p.contains(
+      '${Platform.pathSeparator}$cacheFolder${Platform.pathSeparator}');
+
+  /// 只扫这两个目录的顶层，把文件名对得上的裸文件补进纸条。
+  /// 不递归、不碰别处、不删任何文件；已在纸条里的跳过。
+  Future<List<String>> _claimFiles({
+    required String id,
+    required String title,
+    required String artist,
+  }) async {
+    await _load();
+    // 写入时歌名/歌手为空会落成「未知歌曲 - 未知歌手」，两组都试着认。
+    final t = _cleanName(title.isEmpty ? id : title);
+    final a = _cleanName(artist);
+    final t2 = _cleanName(title.isEmpty ? '未知歌曲' : title);
+    final a2 = _cleanName(artist.isEmpty ? '未知歌手' : artist);
+    final claimed = <String>[];
+    for (final pinned in <bool>[false, true]) {
+      final dir = await _ensureDir(pinned);
+      if (!dir.existsSync()) continue;
+      List<File> files;
+      try {
+        files = dir.listSync().whereType<File>().toList();
+      } catch (_) {
+        continue;
+      }
+      for (final f in files) {
+        if (f.path.endsWith('.part')) continue;
+        if (_index.any((r) => r['path'] == f.path)) continue;
+        final name = f.path.split(Platform.pathSeparator).last;
+        final parsed = _parseFileName(name);
+        if (parsed == null) continue;
+        // 超长歌名写入时被截断过，这里允许「文件名是原名前缀」也算同一首。
+        final pt = parsed['t']!;
+        final pa = parsed['a']!;
+        bool match(String et, String ea) {
+          final titleOk = pt == et || et.startsWith(pt);
+          final artistOk = pa == ea || pa.isEmpty || ea.startsWith(pa);
+          return titleOk && artistOk;
+        }
+
+        if (!match(t, a) && !match(t2, a2)) continue;
+        final q = parsed['q']!;
+        _index.add(<String, dynamic>{
+          'id': id,
+          'title': t,
+          'artist': a,
+          'requested': q,
+          'quality': q,
+          'path': f.path,
+          'pinned': pinned,
+          'size': _safeSize(f),
+          'time': DateTime.now().millisecondsSinceEpoch,
+        });
+        claimed.add(f.path);
+      }
+    }
+    if (claimed.isNotEmpty) {
+      await _save();
+      _bump();
+    }
+    return claimed;
+  }
+
+  static int _safeSize(File f) {
+    try {
+      return f.lengthSync();
+    } catch (_) {
+      return 0;
+    }
   }
 
   /// 菜单「下载」用：该档已存在就复用（翻 pinned + 归到下载夹子），否则整首下。
@@ -481,8 +606,12 @@ class OnlineDownloadService {
       return _fail('下载中断或写不进手机：可能断网、地址过期或存储不足。', task);
     }
 
-    _index.removeWhere(
-        (r) => r['id'] == id && r['requested'] == quality);
+    // 只清「同 id + 同档 + 同一夹子」的旧记录：
+    // 缓存 320 和下载 320 要能同时留在纸条里，互不覆盖。
+    _index.removeWhere((r) =>
+        r['id'] == id &&
+        r['requested'] == quality &&
+        ((r['pinned'] == true) == pinned));
     _index.add(<String, dynamic>{
       'id': id,
       'title': metaTitle,
@@ -623,23 +752,21 @@ class OnlineDownloadService {
   // 命名工具：缓存与手动下载共用，标准档不标，其余档位加方括号缩写。
   // ---------------------------------------------------------------------------
 
+  /// 只改两档标签：高品质 → [HQ]、无损 → [SQ]，方括号保留。
+  /// 标准档不标；Hi-Res / 母带 / 旧 [320K] 写法都照旧。
   static String _qualityTag(String q) {
     final v = q.trim().toLowerCase();
     if (v.isEmpty) return '';
     if (v == '128' || v == 'standard' || v == '标准' || v == 'normal') {
       return '';
     }
-    // 纯数字档位（192 / 320 / 999 等）统一写成 [xxxK]。
+    if (v == '320' || v == 'hq' || v == '高品质') return '[HQ]';
+    if (v == 'flac' || v == 'sq' || v == 'lossless' || v == '无损') {
+      return '[SQ]';
+    }
+    // 其它纯数字档位（192 / 999 等）仍写成 [xxxK]，兼容旧文件。
     if (RegExp(r'^\d+$').hasMatch(v)) return '[${v}K]';
     switch (v) {
-      case 'hq':
-      case '高品质':
-        return '[320K]';
-      case 'flac':
-      case 'sq':
-      case 'lossless':
-      case '无损':
-        return '[FLAC]';
       case 'high': // AudioQuality.hires 的 value
       case 'hires':
       case 'hi-res':
@@ -654,18 +781,63 @@ class OnlineDownloadService {
     }
   }
 
+  /// 文件名末尾的 [XXX] 反推档位 value；没有标记 = 标准档。
+  /// 旧写法 [320K] / [FLAC] 也认，方便扫到上一版留下的文件。
+  static String _qualityFromTag(String tag) {
+    final v = tag.trim().toUpperCase();
+    switch (v) {
+      case '':
+        return '128';
+      case 'HQ':
+        return '320';
+      case 'SQ':
+      case 'FLAC':
+        return 'flac';
+      case 'HR':
+        return 'high';
+      case 'MASTER':
+        return 'viper_tape';
+      default:
+        final m = RegExp(r'^(\d+)K$').firstMatch(v);
+        if (m != null) return m.group(1)!;
+        return tag.trim().toLowerCase();
+    }
+  }
+
+  /// 文件名非法字符处理，写入和比对共用一套，避免中英文/符号对不上。
+  static String _cleanName(String s) => s
+      .replaceAll(RegExp(r'[\\/:*?"<>|\r\n\t]'), '_')
+      .trim()
+      .replaceAll(RegExp(r'\.+$'), '');
+
+  /// 拆「歌曲名 - 歌手 [标记].扩展名」→ 标题 / 歌手 / 档位 value。
+  /// 歌名里也可能带 " - "，所以从右边切一次；撞名后缀 (2) 忽略。
+  static Map<String, String>? _parseFileName(String name) {
+    final dot = name.lastIndexOf('.');
+    final stem = dot > 0 ? name.substring(0, dot) : name;
+    var base = stem.replaceAll(RegExp(r' \(\d+\)$'), '');
+    var tag = '';
+    final m = RegExp(r' \[([^\]]+)\]$').firstMatch(base);
+    if (m != null) {
+      tag = m.group(1)!;
+      base = base.substring(0, m.start);
+    }
+    final i = base.lastIndexOf(' - ');
+    if (i <= 0) return null;
+    final t = base.substring(0, i).trim();
+    final a = base.substring(i + 3).trim();
+    if (t.isEmpty) return null;
+    return <String, String>{'t': t, 'a': a, 'q': _qualityFromTag(tag)};
+  }
+
   static String _displayFileName(
     String title,
     String artist,
     String quality,
     String ext,
   ) {
-    String clean(String s) => s
-        .replaceAll(RegExp(r'[\\/:*?"<>|\r\n\t]'), '_')
-        .trim()
-        .replaceAll(RegExp(r'\.+$'), '');
-    final t = clean(title.isEmpty ? '未知歌曲' : title);
-    final a = clean(artist.isEmpty ? '未知歌手' : artist);
+    final t = _cleanName(title.isEmpty ? '未知歌曲' : title);
+    final a = _cleanName(artist.isEmpty ? '未知歌手' : artist);
     var base = '$t - $a';
     // 按 Unicode 码点截断，避免把 emoji 切成半个代理对；中文件名也留足余量。
     if (base.runes.length > 70) {
