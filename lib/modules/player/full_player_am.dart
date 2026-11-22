@@ -5604,6 +5604,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                   ListTile(
                     leading: const Icon(Icons.playlist_add),
                     title: const Text('添加到歌单'),
+                    trailing: TextButton.icon(
+                      onPressed: () => showDownloadQualityDialog(rootContext, song),
+                      icon: const Icon(Icons.download, size: 18),
+                      label: const Text('下载'),
+                    ),
                     onTap: () {
                       Navigator.pop(sheetContext);
                       showAddToPlaylistDialog(rootContext, song);
