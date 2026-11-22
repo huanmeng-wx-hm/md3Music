@@ -76,7 +76,7 @@ import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/comment_reply_target.dart';
 import 'comment_compose_sheet.dart';
 import 'comments_view.dart';
-import 'lyrics_view.dart';
+import 'md3_lyric_view.dart';
 import 'player_tab_layout.dart';
 import 'player_tab_pager.dart';
 import 'player_volume_state.dart';
@@ -2063,44 +2063,78 @@ class _FullPlayerState extends State<FullPlayer>
       final matchInfo = song is Song ? matchInfoForSong(song) : null;
       final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
 
-      // 本地歌曲优先读取内嵌歌词（ID3 USLT / SYLT / Vorbis LYRICS / MP4 ©lyr）；
-      // 单曲偏好开启时跳过，直接走在线。云盘歌曲无本地文件，跳过内嵌读取。
-      if (song is Song && !song.isOnline && !song.isCloud && !preferOnlineLyrics) {
-        final embedded = await LocalLyricLoader.loadForSongAsync(
-          localPath: song.localPath,
-          cachedLyrics: song.localLyrics,
-        );
+      // 本次播放能否拿到本地音频文件：本地歌看 localPath，
+      // 在线歌命中缓存后 url 变成 file:///...，也据此放行。
+      // 注意：绝不动 song.isOnline，富化 / CDN / 听歌上报全挂在这个标志上。
+      final audioPath = song is Song
+          ? LocalLyricLoader.audioPathFor(
+              localPath: song.localPath,
+              url: song.url,
+              isCloud: song.isCloud,
+            )
+          : null;
+      final allowLocal =
+          song is Song && !preferOnlineLyrics && audioPath != null;
+
+      // ① 内嵌：播放时只读音频头部的歌词标签，不落盘、不整读文件。
+      //    MP3 ID3v2 / FLAC Vorbis / M4A ©lyr / OGG Vorbis Comment 都走这条。
+      if (allowLocal) {
+        final embedded =
+            await LocalLyricLoader.readEmbeddedOnlyAsync(audioPath!);
         if (embedded != null && embedded.isNotEmpty) lyricText = embedded;
       }
 
-      // 内嵌歌词为空（或偏好在线）时回退到酷狗 API
+      // ② 在线：原酷狗链路一字不动；网络异常也不挡住第 ③ 级兜底。
       if (lyricText.isEmpty) {
         if (!mounted || generation != _lyricFetchGeneration) return;
-        final kugouProvider = context.read<KugouProvider>();
-        // 本地/云盘歌曲：命中匹配记忆时用在线 hash 精确检索；未命中传空 hash
-        // 让酷狗 API 完全基于 songName 搜索歌词
-        final matchedHash =
-            (matchInfo != null && matchInfo.isMatched) ? matchInfo.hash : null;
-        final lyricHash = matchedHash ??
-            ((song is Song && !song.isOnline) ? '' : songId);
-        // 搜索关键词用"歌名 艺术家"提高匹配准确度
-        final searchName = (song is Song && song.artist != '未知艺术家')
-            ? '${song.title} ${song.artist}'
-            : song.title;
-        final lyric = await kugouProvider.getLyric(lyricHash, songName: searchName,
-          onProgress: (partial) => showLyrics(
-            partial.displayKrcLyric ?? partial.displayLrcLyric ?? partial.displayLyric ?? '',
-            translationText: partial.translatedContent, romaText: partial.romaContent,
-          ),
-        );
-        if (mounted && generation == _lyricFetchGeneration) {
-          lyricText =
-              lyric?.displayKrcLyric ??
-              lyric?.displayLrcLyric ??
-              lyric?.displayLyric ??
-              '';
-          translationText = lyric?.translatedContent;
-          romaText = lyric?.romaContent;
+        try {
+          final kugouProvider = context.read<KugouProvider>();
+          final matchedHash =
+              (matchInfo != null && matchInfo.isMatched) ? matchInfo.hash : null;
+          final lyricHash = matchedHash ??
+              ((song is Song && !song.isOnline) ? '' : songId);
+          final searchName = (song is Song && song.artist != '未知艺术家')
+              ? '${song.title} ${song.artist}'
+              : song.title;
+          final lyric = await kugouProvider.getLyric(lyricHash,
+            songName: searchName,
+            onProgress: (partial) => showLyrics(
+              partial.displayKrcLyric ??
+                  partial.displayLrcLyric ??
+                  partial.displayLyric ??
+                  '',
+              translationText: partial.translatedContent,
+              romaText: partial.romaContent,
+            ),
+          );
+          if (mounted && generation == _lyricFetchGeneration) {
+            lyricText =
+                lyric?.displayKrcLyric ??
+                lyric?.displayLrcLyric ??
+                lyric?.displayLyric ??
+                '';
+            translationText = lyric?.translatedContent;
+            romaText = lyric?.romaContent;
+          }
+        } catch (_) {
+          // 断网 / 502：继续走外挂兜底，不让整段落到外层 catch 丢掉歌词。
+          translationText = null;
+          romaText = null;
+        }
+      }
+
+      // ③ 外挂兜底：扫描阶段缓存的歌词，或音频同目录同名 .lrc/.ttml/.txt。
+      //    只有内嵌与在线都没拿到时才轮到它 —— 优先级「内嵌 → 在线 → 外挂」。
+      if (lyricText.isEmpty && allowLocal) {
+        final String? cached =
+            song is Song ? song.localLyrics : null;
+        final sidecar = (cached != null && cached.isNotEmpty)
+            ? cached
+            : await LocalLyricLoader.readSidecarOnlyAsync(audioPath!);
+        if (sidecar != null && sidecar.isNotEmpty) {
+          lyricText = sidecar;
+          translationText = null;
+          romaText = null;
         }
       }
 
@@ -2525,7 +2559,9 @@ class _FullPlayerState extends State<FullPlayer>
                         // P0: 歌词时间只订阅 positionNotifier（高频 200ms），
                         // 不再因 positionStream 触发整页重建
                         : RepaintBoundary(
-                            child: LyricsView(
+                            child: Md3LyricView(
+                              playerProvider: playerProvider,
+                              songBpm: currentSong?.bpm,
                               lyrics: _lyrics,
                               parsedLyrics: _lyricMetadata,
                               position: Duration.zero,
@@ -2930,7 +2966,9 @@ class _FullPlayerState extends State<FullPlayer>
                                       )
                                     // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
                                     : RepaintBoundary(
-                                        child: LyricsView(
+                                        child: Md3LyricView(
+                                          playerProvider: playerProvider,
+                                          songBpm: currentSong?.bpm,
                                           lyrics: _lyrics,
                                           parsedLyrics: _lyricMetadata,
                                           position: Duration.zero,
@@ -3311,7 +3349,9 @@ class _FullPlayerState extends State<FullPlayer>
                                       )
                                     // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
                                     : RepaintBoundary(
-                                        child: LyricsView(
+                                        child: Md3LyricView(
+                                          playerProvider: playerProvider,
+                                          songBpm: currentSong?.bpm,
                                           lyrics: _lyrics,
                                           parsedLyrics: _lyricMetadata,
                                           position: Duration.zero,
