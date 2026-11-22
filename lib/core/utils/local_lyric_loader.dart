@@ -18,7 +18,7 @@ class LocalLyricLoader {
 
   /// compute 超时不会取消后台 isolate；限制同时解析的本地音乐歌词任务，
   /// 防止快速切歌时多个大 ID3/FLAC 标签解析任务堆积。
-  static String? _activeAsyncReadPath;
+  static String? _activeAsyncReadKey;
   static Future<String?>? _activeAsyncRead;
 
   /// 仅从音频头部读取元数据的最大字节数。
@@ -39,6 +39,62 @@ class LocalLyricLoader {
     return loadForAudioAsync(localPath);
   }
 
+  /// 从 Song 里挑出「这次播放真正能读到的本地音频路径」。
+  ///
+  /// 本地歌看 [localPath]；在线歌命中缓存后 [url] 会变成 `file:///...`，
+  /// 也据此放行。云盘歌无本地文件，一律返回 null。
+  /// `content://` 不认（那份由扫描阶段缓存的 localLyrics 处理）。
+  static String? audioPathFor({
+    String? localPath,
+    String? url,
+    bool isCloud = false,
+  }) {
+    if (isCloud) return null;
+    for (final candidate in <String?>[localPath, url]) {
+      if (candidate == null || candidate.isEmpty) continue;
+      if (candidate.startsWith('content://')) continue;
+      final path = _normalizePath(candidate);
+      if (path.isEmpty) continue;
+      return path;
+    }
+    return null;
+  }
+
+  /// 只取内嵌歌词文本，不读同目录同名外挂。
+  static String? readEmbeddedOnly(String filePath) {
+    final path = _normalizePath(filePath);
+    if (path.isEmpty) return null;
+    return _readEmbeddedLyrics(path);
+  }
+
+  /// 只取同目录同名外挂（.lrc / .ttml / .txt），不读内嵌。
+  static String? readSidecarOnly(String filePath) {
+    final path = _normalizePath(filePath);
+    if (path.isEmpty) return null;
+    return _findSidecarLyric(path);
+  }
+
+  /// 播放时「临时抠出内嵌歌词」：后台 isolate + 5s 超时，不落盘。
+  static Future<String?> readEmbeddedOnlyAsync(String filePath) =>
+      _runRead(filePath, 'embedded', _embeddedOnlyInIsolate);
+
+  /// 外挂兜底同样走 isolate，避免大目录遍历压住 UI。
+  static Future<String?> readSidecarOnlyAsync(String filePath) =>
+      _runRead(filePath, 'sidecar', _sidecarOnlyInIsolate);
+
+  /// `file://` → 真实路径；`content://` 与空串统一返回空。
+  static String _normalizePath(String raw) {
+    if (raw.isEmpty) return '';
+    if (raw.startsWith('file://')) {
+      try {
+        return Uri.parse(raw).toFilePath();
+      } catch (_) {
+        return '';
+      }
+    }
+    return raw;
+  }
+
   /// 加载本地歌曲歌词：先内嵌，无内嵌时查找同目录同名歌词文件。
   ///
   /// 兼容 file:// URI 与裸绝对路径。返回歌词文本，无则 null。
@@ -57,23 +113,31 @@ class LocalLyricLoader {
   /// 异步版本：把内嵌歌词的元数据读取与侧车歌词文件读取整体移入后台 isolate
   /// 执行，并带超时兜底。任何耗时/异常/超时都不会阻塞主隔离区（避免在切歌/播放
   /// 瞬间拖垮 UI 甚至被判定为无响应而崩溃）；返回 null 时由调用方回退到酷狗接口。
-  static Future<String?> loadForAudioAsync(String filePath) async {
-    final path = filePath.startsWith('file://')
-        ? Uri.parse(filePath).toFilePath()
-        : filePath;
+  /// 异步版本：后台 isolate 执行，带 5s 超时与串行闸门。
+  /// 返回 null 时由调用方回退到下一级歌词来源。
+  static Future<String?> loadForAudioAsync(String filePath) =>
+      _runRead(filePath, 'all', _loadForAudioInIsolate);
+
+  /// 统一的 isolate 读取闸门：同一 key 复用在途任务，不同 key 串行排队。
+  /// compute 超时不会取消后台 isolate，所以完成前不释放闸门。
+  static Future<String?> _runRead(
+    String filePath,
+    String label,
+    String? Function(String) work,
+  ) async {
+    final path = _normalizePath(filePath);
     if (path.isEmpty) return null;
+    final key = '$path|$label';
 
     final active = _activeAsyncRead;
     if (active != null) {
-      // 同一首歌复用解析任务；不同歌曲等当前 isolate 结束后串行启动，避免并发
-      // 解析占用内存。旧逻辑在路径不同时直接返回 null，快速切歌就会丢掉新歌歌词。
-      if (_activeAsyncReadPath != path) {
+      if (_activeAsyncReadKey != key) {
         try {
           await active.timeout(const Duration(seconds: 5));
         } catch (_) {
           return null;
         }
-        return loadForAudioAsync(path);
+        return _runRead(path, label, work);
       }
       try {
         return await active.timeout(const Duration(seconds: 5));
@@ -82,16 +146,15 @@ class LocalLyricLoader {
       }
     }
 
-    final read = Future<String?>.sync(() => compute(_loadForAudioInIsolate, path));
-    _activeAsyncReadPath = path;
+    final read = Future<String?>.sync(() => compute(work, path));
+    _activeAsyncReadKey = key;
     _activeAsyncRead = read;
     void clearRead() {
       if (identical(_activeAsyncRead, read)) {
-        _activeAsyncReadPath = null;
+        _activeAsyncReadKey = null;
         _activeAsyncRead = null;
       }
     }
-    // 超时只结束调用方等待，底层 compute 仍运行；完成前不能释放并发闸门。
     read.then<void>((_) => clearRead(), onError: (_, _) => clearRead());
     try {
       return await read.timeout(const Duration(seconds: 5));
@@ -107,8 +170,26 @@ class LocalLyricLoader {
   /// （如 TTML XML 声明的 `version="1.0"`）会被截断到第一个 `=`，
   /// 因此 FLAC 内嵌歌词改为手动解析 LYRICS 标签（取第一个 `=` 后完整值）。
   static String? _readEmbeddedLyrics(String filePath) {
-    final isMp3 = filePath.toLowerCase().endsWith('.mp3');
-    if (filePath.toLowerCase().endsWith('.flac')) {
+    final lower = filePath.toLowerCase();
+
+    // M4A / MP4 / AAC：只走 moov→udta→meta→ilst→©lyr→data 的 atom 树，
+    // 每次只读命中的那一小段，不受 _maxEmbeddedReadBytes 整文件大小限制。
+    if (lower.endsWith('.m4a') || lower.endsWith('.mp4') ||
+        lower.endsWith('.aac') || lower.endsWith('.m4b')) {
+      final mp4 = _readMp4Lyrics(filePath);
+      if (mp4 != null && mp4.isNotEmpty) return mp4;
+    }
+
+    // OGG / OGA / OPUS：逐页拼 Vorbis Comment / OpusTags packet，
+    // 只扫文件头部若干 page，音频帧一字节不进内存。
+    if (lower.endsWith('.ogg') || lower.endsWith('.oga') ||
+        lower.endsWith('.opus')) {
+      final ogg = _readOggLyrics(filePath);
+      if (ogg != null && ogg.isNotEmpty) return ogg;
+    }
+
+    final isMp3 = lower.endsWith('.mp3');
+    if (lower.endsWith('.flac')) {
       final flacLyrics = _readFlacLyrics(filePath);
       if (flacLyrics != null && flacLyrics.isNotEmpty) return flacLyrics;
     }
@@ -485,10 +566,216 @@ class LocalLyricLoader {
     } catch (_) {}
     return null;
   }
+
+  // ===== M4A / MP4 ©lyr：按 atom 树随机读取，不整读文件 =====
+
+  /// 在 [start, end) 的 MP4 atom 列表里找 [type]（4 字节），
+  /// 返回 (内容起, 内容止)；已跳过 atom 自身 8/16 字节头。
+  static (int, int)? _findAtom(
+    RandomAccessFile rf,
+    int start,
+    int end,
+    List<int> type,
+  ) {
+    var pos = start;
+    var guard = 0;
+    while (pos + 8 <= end && guard < 4096) {
+      guard++;
+      rf.setPositionSync(pos);
+      final header = rf.readSync(8);
+      if (header.length < 8) return null;
+      var size = _mp4Be32(header, 0);
+      var headerSize = 8;
+      if (size == 1) {
+        final ext = rf.readSync(8);
+        if (ext.length < 8) return null;
+        size = (_mp4Be32(ext, 0) << 32) | _mp4Be32(ext, 4);
+        headerSize = 16;
+      } else if (size == 0) {
+        size = end - pos;
+      }
+      if (size < headerSize || pos + size > end) return null;
+      if (header[4] == type[0] &&
+          header[5] == type[1] &&
+          header[6] == type[2] &&
+          header[7] == type[3]) {
+        return (pos + headerSize, pos + size);
+      }
+      pos += size;
+    }
+    return null;
+  }
+
+  static int _mp4Be32(List<int> b, int o) =>
+      (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3];
+
+  static int _mp4Le32(List<int> b, int o) =>
+      b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24);
+
+  static List<int> _atom(String s) => s.codeUnits;
+
+  /// 读取 MP4 内嵌歌词（©lyr）。moov 常被工具挪到文件尾，
+  /// 这里按 atom 头逐层跳转，不把整首音频读进内存。
+  static String? _readMp4Lyrics(String filePath) {
+    RandomAccessFile? rf;
+    try {
+      final file = File(filePath);
+      if (!file.existsSync()) return null;
+      rf = file.openSync();
+      final fileLen = rf.lengthSync();
+
+      final moov = _findAtom(rf, 0, fileLen, _atom('moov'));
+      if (moov == null) return null;
+      final udta = _findAtom(rf, moov.$1, moov.$2, _atom('udta'));
+      if (udta == null) return null;
+      final meta = _findAtom(rf, udta.$1, udta.$2, _atom('meta'));
+      if (meta == null) return null;
+      // meta 内容开头 4 字节是 version/flags，子 atom 从 +4 起。
+      final ilst = _findAtom(rf, meta.$1 + 4, meta.$2, _atom('ilst'));
+      if (ilst == null) return null;
+      // ©lyr 的 atom 类型是 Latin-1 的 0xA9 + "lyr"。
+      final lyr = _findAtom(
+        rf,
+        ilst.$1,
+        ilst.$2,
+        <int>[0xA9, 0x6C, 0x79, 0x72],
+      );
+      if (lyr == null) return null;
+      final data = _findAtom(rf, lyr.$1, lyr.$2, _atom('data'));
+      if (data == null) return null;
+
+      final len = data.$2 - data.$1;
+      if (len < 8 || len > 8 * 1024 * 1024) return null;
+      rf.setPositionSync(data.$1);
+      final bytes = rf.readSync(len);
+
+      // data 内容：version/flags(4) + type indicator(4) + [locale(4)] + 文本
+      var offset = 4;
+      for (var i = 0; i < 2 && offset + 4 <= bytes.length; i++) {
+        final word = _mp4Be32(bytes, offset);
+        if (word == 0 || word == 1) {
+          offset += 4;
+        } else {
+          break;
+        }
+      }
+      if (offset >= bytes.length) return null;
+      final text =
+          utf8.decode(bytes.sublist(offset), allowMalformed: true).trim();
+      return text.isEmpty ? null : text;
+    } catch (_) {
+      return null;
+    } finally {
+      rf?.closeSync();
+    }
+  }
+
+  // ===== OGG / OGA / OPUS：拼 Vorbis Comment / OpusTags packet =====
+
+  /// 只扫文件头部若干 Ogg page，按 lacing table 拼出完整 packet，
+  /// 命中 LYRICS= 立刻返回。
+  static String? _readOggLyrics(String filePath) {
+    RandomAccessFile? rf;
+    try {
+      final file = File(filePath);
+      if (!file.existsSync()) return null;
+      rf = file.openSync();
+      final fileLen = rf.lengthSync();
+      final maxScan =
+          fileLen < 4 * 1024 * 1024 ? fileLen : 4 * 1024 * 1024;
+
+      var pos = 0;
+      var pages = 0;
+      final pending = <int>[];
+      while (pos + 27 <= maxScan && pages < 1024) {
+        rf.setPositionSync(pos);
+        final header = rf.readSync(27);
+        if (header.length < 27 ||
+            String.fromCharCodes(header.sublist(0, 4)) != 'OggS') {
+          break;
+        }
+        final segCount = header[26];
+        if (pos + 27 + segCount > maxScan) break;
+        final table = rf.readSync(segCount);
+        var payloadLen = 0;
+        for (final s in table) {
+          payloadLen += s;
+        }
+        if (pos + 27 + segCount + payloadLen > maxScan) break;
+        final payload =
+            payloadLen > 0 ? rf.readSync(payloadLen) : <int>[];
+
+        var p = 0;
+        for (final s in table) {
+          if (s > 0) {
+            final stop = p + s;
+            if (stop > payload.length) break;
+            pending.addAll(payload.sublist(p, stop));
+            p = stop;
+          }
+          if (s < 255) {
+            final lyrics = _parseCommentPacket(pending);
+            if (lyrics != null) return lyrics;
+            pending.clear();
+          }
+        }
+        pos += 27 + segCount + payloadLen;
+        pages++;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      rf?.closeSync();
+    }
+  }
+
+  /// Vorbis comment header（\x03vorbis）与 OpusTags 共用
+  /// vendor + comment count + [len][KEY=value] 结构。
+  static String? _parseCommentPacket(List<int> packet) {
+    if (packet.length < 8) return null;
+    final isVorbis = packet[0] == 0x03 &&
+        String.fromCharCodes(packet.sublist(1, 7)) == 'vorbis';
+    final isOpus =
+        String.fromCharCodes(packet.sublist(0, 8)) == 'OpusTags';
+    if (!isVorbis && !isOpus) return null;
+
+    var off = isVorbis ? 7 : 8;
+    if (off + 4 > packet.length) return null;
+    final vendorLen = _mp4Le32(packet, off);
+    off += 4;
+    if (vendorLen < 0 || off + vendorLen + 4 > packet.length) return null;
+    off += vendorLen;
+    final count = _mp4Le32(packet, off);
+    off += 4;
+    if (count < 0 || count > 4096) return null;
+
+    for (var i = 0; i < count; i++) {
+      if (off + 4 > packet.length) return null;
+      final len = _mp4Le32(packet, off);
+      off += 4;
+      if (len < 0 || off + len > packet.length) return null;
+      final comment =
+          utf8.decode(packet.sublist(off, off + len), allowMalformed: true);
+      off += len;
+      final eq = comment.indexOf('=');
+      if (eq > 0 && comment.substring(0, eq).toUpperCase() == 'LYRICS') {
+        final value = comment.substring(eq + 1);
+        return value.isEmpty ? null : value;
+      }
+    }
+    return null;
+  }
 }
 
 /// compute isolate 的工作函数：在后台 isolate 中同步执行完整歌词加载。
 String? _loadForAudioInIsolate(String path) => LocalLyricLoader.loadForAudio(path);
+
+String? _embeddedOnlyInIsolate(String path) =>
+    LocalLyricLoader.readEmbeddedOnly(path);
+
+String? _sidecarOnlyInIsolate(String path) =>
+    LocalLyricLoader.readSidecarOnly(path);
 
 class _SyltEntry {
   final String text;
